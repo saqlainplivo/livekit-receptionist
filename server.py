@@ -77,8 +77,12 @@ async def call(request: Request):
     # ── Option A: LiveKit SIP outbound (preferred) ────────────────────────
     if SIP_TRUNK_ID:
         try:
+            # LiveKitAPI needs HTTP(S) URL, convert from WSS if needed
+            lk_url = os.getenv("LIVEKIT_URL", "")
+            lk_url = lk_url.replace("wss://", "https://").replace("ws://", "http://")
+
             lk_api = LiveKitAPI(
-                url=os.getenv("LIVEKIT_URL"),
+                url=lk_url,
                 api_key=os.getenv("LIVEKIT_API_KEY"),
                 api_secret=os.getenv("LIVEKIT_API_SECRET"),
             )
