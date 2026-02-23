@@ -6,12 +6,11 @@ Stack:
 - STT:  Deepgram Nova-2
 - TTS:  Deepgram Aura (asteria voice)
 - VAD:  Silero
-- Turn: LiveKit multilingual turn-detector
+- Turn: LiveKit turn-detector
 """
 
 import os
 import time
-import json
 import logging
 
 from dotenv import load_dotenv
@@ -28,13 +27,24 @@ from livekit.agents import (
 )
 from livekit.agents.llm import function_tool
 from livekit.plugins import deepgram, groq, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from db import init_db, log_call
 
 load_dotenv()
 
 logger = logging.getLogger("receptionist")
+
+# Try to import turn detector — not critical if unavailable
+try:
+    from livekit.plugins.turn_detector.multilingual import MultilingualModel
+    TURN_DETECTOR = MultilingualModel()
+except ImportError:
+    try:
+        from livekit.plugins import turn_detector
+        TURN_DETECTOR = turn_detector.EOUModel()
+    except Exception:
+        TURN_DETECTOR = None
+        logger.warning("Turn detector not available, using default")
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 
@@ -119,13 +129,16 @@ server.setup_fnc = prewarm
 async def entrypoint(ctx: JobContext):
     agent = ReceptionistAgent()
 
-    session = AgentSession(
+    session_kwargs = dict(
         stt=deepgram.STT(model="nova-2", language="en"),
         llm=groq.LLM(model="llama-3.3-70b-versatile"),
         tts=deepgram.TTS(voice="aura-asteria-en"),
         vad=ctx.proc.userdata["vad"],
-        turn_detection=MultilingualModel(),
     )
+    if TURN_DETECTOR is not None:
+        session_kwargs["turn_detection"] = TURN_DETECTOR
+
+    session = AgentSession(**session_kwargs)
 
     await session.start(
         room=ctx.room,
