@@ -34,17 +34,13 @@ load_dotenv()
 
 logger = logging.getLogger("receptionist")
 
-# Try to import turn detector — not critical if unavailable
+# Import turn detector class — instantiated later inside the job entrypoint
 try:
     from livekit.plugins.turn_detector.multilingual import MultilingualModel
-    TURN_DETECTOR = MultilingualModel()
+    HAS_TURN_DETECTOR = True
 except ImportError:
-    try:
-        from livekit.plugins import turn_detector
-        TURN_DETECTOR = turn_detector.EOUModel()
-    except Exception:
-        TURN_DETECTOR = None
-        logger.warning("Turn detector not available, using default")
+    HAS_TURN_DETECTOR = False
+    logger.warning("Turn detector not available, using default")
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 
@@ -135,8 +131,8 @@ async def entrypoint(ctx: JobContext):
         tts=deepgram.TTS(voice="aura-asteria-en"),
         vad=ctx.proc.userdata["vad"],
     )
-    if TURN_DETECTOR is not None:
-        session_kwargs["turn_detection"] = TURN_DETECTOR
+    if HAS_TURN_DETECTOR:
+        session_kwargs["turn_detection"] = MultilingualModel()
 
     session = AgentSession(**session_kwargs)
 
