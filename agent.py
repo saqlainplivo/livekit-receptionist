@@ -2,34 +2,39 @@
 LiveKit AI Receptionist with Groq LLM
 
 Stack:
-- LLM:  Groq (Llama 3.3 70B) via OpenAI-compatible API
+- LLM:  Groq (Llama 3.3 70B)
 - STT:  Deepgram Nova-2
 - TTS:  Deepgram Aura (asteria voice)
 - VAD:  Silero
-- Turn: LiveKit turn-detector plugin
+- Turn: LiveKit multilingual turn-detector
 """
 
 import os
 import time
 import json
-from typing import Annotated
+import logging
 
 from dotenv import load_dotenv
-from loguru import logger
-from livekit import rtc
+
 from livekit.agents import (
-    AutoSubscribe,
+    Agent,
+    AgentServer,
+    AgentSession,
     JobContext,
-    WorkerOptions,
+    JobProcess,
+    RunContext,
     cli,
-    llm,
+    room_io,
 )
-from livekit.agents.voice_pipeline import VoicePipelineAgent
+from livekit.agents.llm import function_tool
 from livekit.plugins import deepgram, groq, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from db import init_db, log_call
 
 load_dotenv()
+
+logger = logging.getLogger("receptionist")
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 
@@ -46,156 +51,90 @@ Your responsibilities:
 6. Always be polite, professional, and helpful
 """
 
-# ── Tool functions ─────────────────────────────────────────────────────────────
+# ── Agent with tool functions ──────────────────────────────────────────────────
 
-class ReceptionistFunctions(llm.FunctionContext):
-    def __init__(self, caller_number: str) -> None:
-        super().__init__()
-        self._caller_number = caller_number
-        self._detected_intent = "unknown"
+class ReceptionistAgent(Agent):
+    def __init__(self) -> None:
+        super().__init__(instructions=RECEPTIONIST_INSTRUCTIONS)
         self._start_time = time.time()
+        self._detected_intent = "unknown"
 
-    @llm.ai_callable(description="Get the current business hours for TechCorp Solutions.")
-    def get_business_hours(self) -> str:
+    async def on_enter(self):
+        """Called when this agent becomes active — send an immediate greeting."""
+        await self.session.say(
+            "Hello! Thank you for calling TechCorp Solutions. "
+            "My name is Rachel, your virtual receptionist. How can I help you today?",
+            allow_interruptions=True,
+        )
+
+    @function_tool()
+    async def get_business_hours(self, context: RunContext) -> str:
+        """Get the current business hours for TechCorp Solutions."""
         logger.info("Tool called: get_business_hours")
         return (
             "TechCorp Solutions is open Monday through Friday, 9 AM to 6 PM Eastern Time. "
             "We are closed on weekends and major holidays."
         )
 
-    @llm.ai_callable(description="Get the office location and address for TechCorp Solutions.")
-    def get_office_location(self) -> str:
+    @function_tool()
+    async def get_office_location(self, context: RunContext) -> str:
+        """Get the office location and address for TechCorp Solutions."""
         logger.info("Tool called: get_office_location")
         return (
             "TechCorp Solutions is located at 123 Innovation Drive, Suite 400, "
             "San Francisco, California 94105."
         )
 
-    @llm.ai_callable(description="Log the detected caller intent for call tracking purposes.")
-    def log_caller_intent(
+    @function_tool()
+    async def log_caller_intent(
         self,
-        intent: Annotated[str, llm.TypeInfo(description="The detected intent category: sales, support, faq, or other")],
-        summary: Annotated[str, llm.TypeInfo(description="A brief summary of what the caller needs")],
+        context: RunContext,
+        intent: str,
+        summary: str,
     ) -> str:
+        """Log the detected caller intent for call tracking purposes.
+
+        Args:
+            intent: The detected intent category: sales, support, faq, or other
+            summary: A brief summary of what the caller needs
+        """
         logger.info(f"Tool called: log_caller_intent(intent={intent}, summary={summary})")
         self._detected_intent = intent
         return f"Intent recorded as: {intent}."
 
-# ── Post-call analysis ─────────────────────────────────────────────────────────
+# ── App setup ──────────────────────────────────────────────────────────────────
 
-async def perform_post_call_analysis(agent: VoicePipelineAgent):
-    """Use the Groq LLM to summarize the finished call."""
-    if not agent.chat_ctx.messages:
-        return "No summary", "unknown"
+server = AgentServer()
 
-    try:
-        analysis_ctx = agent.chat_ctx.copy()
-        analysis_ctx.append(
-            role="system",
-            text=(
-                'Analyze this conversation. Respond ONLY with JSON: '
-                '{"summary": "<1-sentence summary>", "intent": "<sales|support|hours|location|other>"}'
-            ),
-        )
 
-        response = await agent.llm.chat(chat_ctx=analysis_ctx)
+def prewarm(proc: JobProcess):
+    """Pre-load the Silero VAD model so it's ready when a call arrives."""
+    proc.userdata["vad"] = silero.VAD.load()
 
-        full_text = ""
-        async for chunk in response:
-            content = chunk.choices[0].delta.content
-            if content:
-                full_text += content
 
-        # Extract JSON even if wrapped in markdown fences
-        if "```json" in full_text:
-            full_text = full_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in full_text:
-            full_text = full_text.split("```")[1].split("```")[0].strip()
+server.setup_fnc = prewarm
 
-        analysis = json.loads(full_text)
-        return analysis.get("summary", "No summary"), analysis.get("intent", "unknown")
-    except Exception as e:
-        logger.error(f"Post-call analysis failed: {e}")
-        return "Analysis failed", "error"
 
-# ── Agent entrypoint ───────────────────────────────────────────────────────────
-
+@server.rtc_session(agent_name="receptionist-groq")
 async def entrypoint(ctx: JobContext):
-    logger.info(f"Connecting to room {ctx.room.name}")
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    agent = ReceptionistAgent()
 
-    participant = await ctx.wait_for_participant()
-    caller_number = (
-        participant.identity
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-        else "browser-user"
-    )
-    logger.info(f"Starting session for {caller_number}")
-
-    fnc_ctx = ReceptionistFunctions(caller_number)
-
-    # ── Groq LLM ─────────────────────────────────────────────────────────
-    llm_service = groq.LLM(
-        model="llama-3.3-70b-versatile",
-        api_key=os.getenv("GROQ_API_KEY"),
-    )
-
-    # ── Voice pipeline ────────────────────────────────────────────────────
-    agent = VoicePipelineAgent(
-        vad=silero.VAD.load(),
-        stt=deepgram.STT(
-            model="nova-2",
-            interim_results=True,
-            endpointing_ms=300,
-        ),
-        llm=llm_service,
+    session = AgentSession(
+        stt=deepgram.STT(model="nova-2", language="en"),
+        llm=groq.LLM(model="llama-3.3-70b-versatile"),
         tts=deepgram.TTS(voice="aura-asteria-en"),
-        chat_ctx=llm.ChatContext().append(
-            role="system",
-            text=RECEPTIONIST_INSTRUCTIONS,
-        ),
-        fnc_ctx=fnc_ctx,
+        vad=ctx.proc.userdata["vad"],
+        turn_detection=MultilingualModel(),
     )
 
-    agent.start(ctx.room, participant)
-
-    # Immediate greeting so the caller hears something right away
-    await agent.say(
-        "Hello! Thank you for calling TechCorp Solutions. "
-        "My name is Rachel, your virtual receptionist. How can I help you today?",
-        allow_interruptions=True,
+    await session.start(
+        room=ctx.room,
+        agent=agent,
+        room_options=room_io.RoomOptions(),
     )
-
-    # ── On call end: analyze & log ────────────────────────────────────────
-    @ctx.add_on_finished
-    async def on_finished():
-        duration = int(time.time() - fnc_ctx._start_time)
-
-        summary, intent = await perform_post_call_analysis(agent)
-
-        transcript = ""
-        for msg in agent.chat_ctx.messages:
-            if msg.role == "user" and msg.text:
-                transcript += f"Caller: {msg.text} | "
-            elif msg.role == "assistant" and msg.text:
-                transcript += f"Bot: {msg.text} | "
-
-        log_call(
-            caller_number=caller_number,
-            transcript=transcript.strip(" | "),
-            detected_intent=intent,
-            duration=duration,
-            summary=summary,
-        )
-        logger.info(f"Call ended. Duration={duration}s  Intent={intent}")
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     init_db()
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="receptionist-groq",
-        )
-    )
+    cli.run_app(server)
