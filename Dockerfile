@@ -18,10 +18,13 @@ RUN python -c "from livekit.plugins import silero; silero.VAD.load()"
 # Copy application code
 COPY . .
 
+# Make startup script executable
+RUN chmod +x start.sh
+
 # Railway sets PORT automatically
 ENV PORT=8000
 
 EXPOSE ${PORT}
 
-# Run the LiveKit agent
-CMD ["python", "agent.py", "start"]
+# Run both the LiveKit agent and the FastAPI server
+CMD ["./start.sh"]
